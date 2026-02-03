@@ -10,7 +10,7 @@
 
     # 行情取数
     'DIVIDEND_TYPE': 'front',
-    'DAY_COUNT': 60,
+    'DAY_COUNT': 200,
     'MINUTE_COUNT': 1200,
     'RSI_COUNT': 200,
 
@@ -117,5 +117,10 @@
     'MIN_K_BARS': 200,               # 最小数据长度
     'RET_ABS_MAX': 0.25,
     'MAX_MISSING_RATIO': 0.02,
-    'MAX_GAP_DAYS': 3
+    'MAX_GAP_DAYS': 3,
+
+    # 数据回溯窗口（用于 db_maintainer.py）
+    'DAILY_BACKFILL_TRADE_DAYS': 10,
+    'MONEYFLOW_BACKFILL_TRADE_DAYS': 10,
+    'MINUTE_BACKFILL_TRADE_DAYS': 2
 }

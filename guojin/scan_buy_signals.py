@@ -6,6 +6,7 @@
 """
 
 import os
+import sys
 import math
 import datetime
 from typing import List, Dict, Any, Optional, Tuple
@@ -15,6 +16,9 @@ import numpy as np
 from xtquant import xtdata
 from xtquant.xttrader import XtQuantTrader
 from xtquant.xttype import StockAccount
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 from config import CONFIG
 
 try:
