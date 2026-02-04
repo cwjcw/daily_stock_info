@@ -120,6 +120,13 @@ TS_SEMAPHORE = threading.Semaphore(8)
 TABLE_LOCK = threading.Lock()
 DISABLED_TUSHARE_APIS: set[str] = set()
 TABLE_PREFIX = "S_"
+PERF_LOCK = threading.Lock()
+PERF: Dict[str, float] = {}
+
+
+def perf_add(key: str, delta: float) -> None:
+    with PERF_LOCK:
+        PERF[key] = PERF.get(key, 0.0) + delta
 
 
 def tn(name: str) -> str:
@@ -359,20 +366,27 @@ def update_daily_and_adj(
 
     def worker(date_str: str) -> None:
         try:
+            t0 = time.perf_counter()
             daily = fetch_tushare_paged(pro.daily, api_name="daily", trade_date=date_str)
             if daily is None or daily.empty:
                 _tick(date_str)
                 return
             daily = normalize_daily_units(daily)
             basic = fetch_tushare_paged(pro.daily_basic, api_name="daily_basic", trade_date=date_str)
+            perf_add("daily_fetch", time.perf_counter() - t0)
+
+            t1 = time.perf_counter()
             merged = merge_daily_with_basic(daily, basic)
             ensure_table(engine, tn("daily_raw"), merged, ["ts_code", "trade_date"], ["trade_date"])
             upsert_dataframe(engine, tn("daily_raw"), merged, ["ts_code", "trade_date"])
+            perf_add("daily_upsert", time.perf_counter() - t1)
 
+            t2 = time.perf_counter()
             adj = fetch_tushare_paged(pro.adj_factor, api_name="adj_factor", trade_date=date_str)
             if adj is not None and not adj.empty:
                 ensure_table(engine, tn("adj_factor"), adj, ["ts_code", "trade_date"], ["trade_date"])
                 upsert_dataframe(engine, tn("adj_factor"), adj, ["ts_code", "trade_date"])
+            perf_add("adj_fetch_upsert", time.perf_counter() - t2)
         except Exception as exc:
             print(f"[daily/adj] {date_str} error: {exc}")
         finally:
@@ -418,6 +432,7 @@ def update_moneyflow(
             if missing_by_table and date_str not in missing_by_table.get(table_name, set()):
                 continue
             try:
+                t0 = time.perf_counter()
                 if table_name == "moneyflow_sector":
                     for ct in sector_types:
                         df = fetch_tushare_paged(
@@ -440,6 +455,7 @@ def update_moneyflow(
                         pk = ["ts_code", "trade_date"]
                     ensure_table(engine, tn(table_name), df, pk, ["trade_date"])
                     upsert_dataframe(engine, tn(table_name), df, pk)
+                perf_add("moneyflow_fetch_upsert", time.perf_counter() - t0)
             except Exception as exc:
                 print(f"[moneyflow] {table_name} {date_str} error: {exc}")
         _tick(date_str)
@@ -484,9 +500,11 @@ def normalize_minute_df(df: pd.DataFrame, ts_code: str) -> pd.DataFrame:
     df["trade_date"] = dt.dt.strftime("%Y%m%d")
     df["ts_code"] = ts_code
     if "volume" in df.columns:
-        df["vol"] = pd.to_numeric(df["volume"], errors="coerce")
+        df["vol_share"] = pd.to_numeric(df["volume"], errors="coerce") / 100.0
     elif "vol" in df.columns:
-        df["vol"] = pd.to_numeric(df["vol"], errors="coerce")
+        df["vol_share"] = pd.to_numeric(df["vol"], errors="coerce") / 100.0
+    elif "vol_share" in df.columns:
+        df["vol_share"] = pd.to_numeric(df["vol_share"], errors="coerce")
     return df
 
 
@@ -495,6 +513,11 @@ def normalize_daily_units(df: pd.DataFrame) -> pd.DataFrame:
     if "amount" in df.columns:
         amt = pd.to_numeric(df["amount"], errors="coerce")
         df["amount"] = amt * 1000.0
+    if "vol" in df.columns:
+        df["vol_share"] = pd.to_numeric(df["vol"], errors="coerce") / 100.0
+        df = df.drop(columns=["vol"])
+    elif "vol_share" in df.columns:
+        df["vol_share"] = pd.to_numeric(df["vol_share"], errors="coerce")
     return df
 
 
@@ -512,7 +535,7 @@ def init_realtime_sqlite(db_path: str) -> None:
                 high REAL,
                 low REAL,
                 pre_close REAL,
-                vol REAL,
+                vol_share REAL,
                 amount REAL,
                 source TEXT,
                 raw_json TEXT,
@@ -537,38 +560,52 @@ def update_minute_raw(
     filtered_list = [s for s in stock_list if not s.startswith(("688", "8", "4"))]
 
     if not date_ranges:
-        print("[minute_raw] missing 0 dates, skip")
+        print("[minute_5m] missing 0 dates, skip")
         return
 
     chunks = [filtered_list[i : i + chunk_size] for i in range(0, len(filtered_list), chunk_size)]
 
     def _download_minute_history(codes: List[str], start_date: str, end_date: str) -> None:
         if hasattr(xtdata, "download_history_data2"):
-            xtdata.download_history_data2(codes, period="1m", start_time=start_date, end_time=end_date)
+            xtdata.download_history_data2(codes, period="5m", start_time=start_date, end_time=end_date)
         else:
             for code in codes:
-                xtdata.download_history_data(code, period="1m", start_time=start_date, end_time=end_date)
+                xtdata.download_history_data(code, period="5m", start_time=start_date, end_time=end_date)
 
-    def worker(codes: List[str], start_date: str, end_date: str) -> None:
+    def worker(chunk_id: int, codes: List[str], start_date: str, end_date: str) -> None:
         try:
+            t0 = time.perf_counter()
+            print(f"[minute_5m] chunk {chunk_id} download start ({len(codes)} codes)")
             _download_minute_history(codes, start_date, end_date)
+            print(f"[minute_5m] chunk {chunk_id} download done {time.perf_counter() - t0:.2f}s")
+            perf_add("minute_download", time.perf_counter() - t0)
+
+            t1 = time.perf_counter()
+            print(f"[minute_5m] chunk {chunk_id} get start")
             data = xtdata.get_market_data_ex(
-                [], codes, period="1m", start_time=start_date, end_time=end_date, dividend_type="none"
+                [], codes, period="5m", start_time=start_date, end_time=end_date, dividend_type="none"
             )
+            print(f"[minute_5m] chunk {chunk_id} get done {time.perf_counter() - t1:.2f}s")
+            perf_add("minute_get", time.perf_counter() - t1)
+
+            t2 = time.perf_counter()
+            print(f"[minute_5m] chunk {chunk_id} upsert start")
             for code, df in data.items():
                 if df is None or df.empty:
                     continue
                 df_norm = normalize_minute_df(df, code)
-                ensure_table(engine, tn("minute_raw"), df_norm, ["ts_code", "trade_time"], ["trade_date"])
-                upsert_dataframe(engine, tn("minute_raw"), df_norm, ["ts_code", "trade_time"])
+                ensure_table(engine, tn("minute_5m"), df_norm, ["ts_code", "trade_time"], ["trade_date"])
+                upsert_dataframe(engine, tn("minute_5m"), df_norm, ["ts_code", "trade_time"])
                 del df_norm
             del data
             gc.collect()
+            print(f"[minute_5m] chunk {chunk_id} upsert done {time.perf_counter() - t2:.2f}s")
+            perf_add("minute_upsert", time.perf_counter() - t2)
         except Exception as exc:
-            print(f"[minute_raw] chunk error: {exc}")
+            print(f"[minute_5m] chunk error: {exc}")
 
     for idx, (start_date, end_date) in enumerate(date_ranges, start=1):
-        print(f"[minute_raw] start range {idx}/{len(date_ranges)} {start_date}~{end_date}")
+        print(f"[minute_5m] start range {idx}/{len(date_ranges)} {start_date}~{end_date}")
         total = len(chunks)
         done = 0
         lock = threading.Lock()
@@ -579,22 +616,19 @@ def update_minute_raw(
                 done += 1
                 if done == 1 or done % 5 == 0 or done == total:
                     print(
-                        f"[minute_raw] range {idx}/{len(date_ranges)} {start_date}~{end_date} "
+                        f"[minute_5m] range {idx}/{len(date_ranges)} {start_date}~{end_date} "
                         f"chunk {done}/{total}"
                     )
 
-        def _worker_wrapper(codes: List[str]) -> None:
+        def _worker_wrapper(args: Tuple[int, List[str]]) -> None:
+            chunk_id, codes = args
             try:
-                worker(codes, start_date, end_date)
+                worker(chunk_id, codes, start_date, end_date)
             finally:
                 _tick()
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            executor.map(_worker_wrapper, chunks)
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        executor.map(worker, chunks)
-
+            executor.map(_worker_wrapper, list(enumerate(chunks, start=1)))
 
 def get_qfq_data(
     engine: Engine,
@@ -603,8 +637,8 @@ def get_qfq_data(
     end: str,
     freq: str = "1d",
 ) -> pd.DataFrame:
-    if freq not in ("1d", "1m"):
-        raise ValueError("freq must be '1d' or '1m'")
+    if freq not in ("1d", "1m", "5m"):
+        raise ValueError("freq must be '1d', '1m' or '5m'")
 
     if freq == "1d":
         sql = text(
@@ -612,7 +646,7 @@ def get_qfq_data(
         )
     else:
         sql = text(
-            "SELECT * FROM S_minute_raw WHERE ts_code=:ts_code AND trade_date>=:start AND trade_date<=:end"
+            "SELECT * FROM S_minute_5m WHERE ts_code=:ts_code AND trade_date>=:start AND trade_date<=:end"
         )
 
     with engine.begin() as conn:
@@ -626,7 +660,7 @@ def get_qfq_data(
     if df.empty or adj.empty:
         return df
 
-    if freq == "1m":
+    if freq in ("1m", "5m"):
         df["trade_date"] = df["trade_time"].astype(str).str[:8]
 
     merged = pd.merge(df, adj[["trade_date", "adj_factor"]], on="trade_date", how="left")
@@ -698,14 +732,19 @@ def main() -> None:
     minute_trade_days = cfg_int("MINUTE_BACKFILL_TRADE_DAYS", 5)
     minute_window = get_trade_dates_ago(pro, effective_today, minute_trade_days)
     if minute_window:
-        existing_minute = get_existing_dates(engine, tn("minute_raw"), "trade_date", minute_window[0], minute_window[-1])
+        existing_minute = get_existing_dates(engine, tn("minute_5m"), "trade_date", minute_window[0], minute_window[-1])
         missing_minute = [d for d in minute_window if d not in existing_minute]
-        summarize_missing("minute_raw", minute_window, missing_minute)
+        summarize_missing("minute_5m", minute_window, missing_minute)
         ranges = build_missing_ranges(minute_window, missing_minute)
     else:
         ranges = []
     xtdata.connect(port=int(os.getenv("QMT_PORT", "58610")))
     update_minute_raw(engine, ranges, chunk_size=100, workers=8)
+
+    if PERF:
+        print("[perf] seconds:")
+        for k in sorted(PERF.keys()):
+            print(f"  {k}: {PERF[k]:.2f}")
 
 
 if __name__ == "__main__":
